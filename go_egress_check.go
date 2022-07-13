@@ -12,8 +12,114 @@ import (
 	"sync"
 	"time"
 
+	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
 )
+
+func ParseQuery(m *dns.Msg) {
+	for _, q := range m.Question {
+		switch q.Qtype {
+		case dns.TypeA:
+			log.Info("DNS query received: " + q.Name)
+
+			response_string := "what.a.shite.domain. A 0.0.0.0"
+
+
+			if strings.Split(q.Name, ".")[0] == "check" {
+				log.Info("Egress possible using DNS")
+
+				response_string = q.Name + " A 1.1.1.1"
+			}
+
+			rr, err := dns.NewRR(response_string)
+
+			if err == nil {
+				m.Answer = append(m.Answer, rr)
+			}
+		}
+	}
+}
+
+func HandleDnsRequest(w dns.ResponseWriter, r *dns.Msg) {
+	m := new(dns.Msg)
+	m.SetReply(r)
+	m.Compress = false
+
+	switch r.Opcode {
+		case dns.OpcodeQuery:
+			ParseQuery(m)
+	}
+
+	w.WriteMsg(m)
+}
+
+func DNSServerGenerator(domain string, port string, wg *sync.WaitGroup) {
+	port_int, _ := strconv.Atoi(port)
+
+	dns.HandleFunc(domain + ".", HandleDnsRequest)
+
+	server := &dns.Server{Addr: ":" + strconv.Itoa(port_int), Net: "udp"}
+
+	log.Info("DNS server started on port " + port)
+
+	err := server.ListenAndServe()
+
+	defer server.Shutdown()
+	if err != nil {
+		log.Error(err)
+	}
+}
+
+func DNSServer(domain string, ports []string) {
+	var wg sync.WaitGroup
+
+	for i := range ports {
+		log.Debug("Attempting to start DNS server on port " + ports[i])
+
+		wg.Add(1)
+
+		go DNSServerGenerator(domain, ports[i], &wg)
+
+		log.Debug("Started DNS server")
+	}
+
+	wg.Wait()
+}
+
+func TestPortDNS(domain string, port string, dest_ip string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	m := new(dns.Msg)
+	m.SetQuestion( "check." + domain + ".", dns.TypeA)
+
+	c := new(dns.Client)
+	in, _, err := c.Exchange(m, dest_ip + ":" + port)
+	if err != nil {
+		log.Error(err)
+	} else {
+		log.Debug("DNS response: " + string(in.Answer[0].String()))
+
+		if strings.Split(in.Answer[0].String(), "\t")[4] == "1.1.1.1" {
+			log.Info("Egress possible using DNS on port " + port + " and ip " + dest_ip)
+		}
+	}
+}
+
+func DNSClient(domain string, ports []string, dest_ip string) {
+	var wg sync.WaitGroup
+
+	for i := range ports {
+		wg.Add(1)
+
+		log.Debug("Attempting to check " + domain + " using nameserver " + dest_ip + ":" + ports[i])
+
+		go TestPortDNS(domain, ports[i], dest_ip, &wg)
+
+		log.Info("DNS data sent")
+	}
+
+	wg.Wait()
+}
 
 func HandleTCPConn(conn net.Conn, src_port string) {
 	log.Debug("Connection received from " + conn.RemoteAddr().String() + " destination port " + src_port)
@@ -161,7 +267,7 @@ func UDPClient(ports []string, dest_ip string) {
 	for i := range ports {
 		wg.Add(1)
 
-		log.Debug("Attempting to bust " + dest_ip + ":" + ports[i])
+		log.Debug("Attempting to check " + dest_ip + ":" + ports[i])
 
 		go TestPortUDP(ports[i], dest_ip, &wg)
 	}
@@ -288,11 +394,13 @@ func main() {
 	var ip string
 	var mode string
 	var protocol string
+	var domain string
 
 	flag.StringVar(&ports_csv, "ports", "", "A comma-seperated list of ports to test for egress access")
 	flag.StringVar(&ip, "ip", "", "The IP address to serve on in server mode, or the target IP address to test egress to in client mode")
 	flag.StringVar(&mode, "mode", "", "Server or client mode (case insensitive)")
-	flag.StringVar(&protocol, "protocol", "", "Protocol to test: tcp, udp, http")
+	flag.StringVar(&protocol, "protocol", "", "Protocol to test: tcp, udp, http, dns")
+	flag.StringVar(&domain, "domain", "", "The domain name to respond/query if in DNS server/client mode")
 
 	flag.Parse()
 
@@ -300,7 +408,7 @@ func main() {
 	protocol = strings.ToLower(protocol)
 
 	log.SetFormatter(&log.JSONFormatter{})
-	log.SetLevel(log.InfoLevel)
+	log.SetLevel(log.DebugLevel)
 
 	ports := strings.Split(ports_csv, ",")
 
@@ -308,34 +416,32 @@ func main() {
 		ports[i] = strings.TrimSpace(ports[i])
 	}
 
-	/*
-		DNS mode
-		common ports mode
-		FTP mode
-		SSH mode
-		Web Socket mode
-	*/
-
 	switch {
-	case (mode == "client") && (protocol == "tcp"):
+	case mode == "client" && protocol == "tcp" && len(ports) != 0 && ip != "":
 		log.Info("Running in TCP client mode")
 		TCPClient(ports, ip)
-	case (mode == "server") && (protocol == "tcp"):
+	case mode == "server" && protocol == "tcp" && len(ports) != 0 && ip != "":
 		log.Info("Running in TCP server mode")
 		TCPServer(ports, ip)
-	case (mode == "server") && (protocol == "udp"):
+	case mode == "server" && protocol == "udp" && len(ports) != 0 && ip != "":
 		log.Info("Running in UDP server mode")
 		UDPServer(ports, ip)
-	case (mode == "client") && (protocol == "udp"):
+	case mode == "client" && protocol == "udp" && len(ports) != 0 && ip != "":
 		log.Info("Running in UDP client mode")
 		UDPClient(ports, ip)
-	case (mode == "server") && (protocol == "http"):
+	case mode == "server" && protocol == "http" && len(ports) != 0 && ip != "":
 		log.Info("Running in HTTP server mode")
 		HTTPServer(ports, ip)
-	case (mode == "client") && (protocol == "http"):
+	case mode == "client" && protocol == "http" && len(ports) != 0 && ip != "":
 		log.Info("Running in HTTP client mode")
 		HTTPClient(ports, ip)
+	case mode == "server" && protocol == "dns" && len(ports) != 0 && domain != "" && ip != "":
+		log.Info("Running in DNS server mode")
+		DNSServer(domain, ports)
+	case mode == "client" && protocol == "dns" && len(ports) != 0 && domain != "" && ip != "":
+		log.Info("Running in DNS client mode")
+		DNSClient(domain, ports, ip)
 	default:
-		log.Info("No correct combination of mode and protocol provided")
+		log.Info("No correct combination of arguments provided")
 	}
 }
